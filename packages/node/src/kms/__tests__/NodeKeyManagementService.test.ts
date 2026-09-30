@@ -9,6 +9,11 @@ import { NodeKeyManagementService } from '../NodeKeyManagementService'
 const agentContext = getAgentContext({ contextCorrelationId: 'default' })
 const agentContextTenant = getAgentContext({ contextCorrelationId: 'd5d0141d-9456-49ec-9c52-338d2f4a7c60' })
 
+const toX25519PublicJwk = (publicJwk: Kms.KmsJwkPublic): Kms.KmsJwkPublicEcdh =>
+  Kms.PublicJwk.fromPublicJwk(publicJwk as Kms.KmsJwkPublicOkp & { crv: 'Ed25519' })
+    .convertTo(Kms.X25519PublicJwk)
+    .toJson()
+
 describe('NodeKeyManagementService', () => {
   let service: NodeKeyManagementService
   let storage: NodeInMemoryKeyManagementStorage
@@ -1520,6 +1525,41 @@ describe('NodeKeyManagementService', () => {
       withEphemeralKeyId,
     }) => {
       const { data } = await service.decrypt(agentContext, await encryptEcdh1Pu(type, withEphemeralKeyId))
+
+      expect(TypedArrayEncoder.toUtf8String(data)).toEqual('heelllo')
+    })
+
+    it('encrypts and decrypts with Ed25519 keys', async () => {
+      const sender = await service.createKey(agentContext, { type: { kty: 'OKP', crv: 'Ed25519' } })
+      const recipient = await service.createKey(agentContext, { type: { kty: 'OKP', crv: 'Ed25519' } })
+      const ephemeral = await service.createKey(agentContext, { type: { kty: 'OKP', crv: 'X25519' } })
+
+      const { encrypted, iv, tag, encryptedKey } = await service.encrypt(agentContext, {
+        key: {
+          keyAgreement: {
+            algorithm: 'ECDH-1PU+A256KW',
+            keyId: sender.keyId,
+            ephemeralKeyId: ephemeral.keyId,
+            externalPublicJwk: toX25519PublicJwk(recipient.publicJwk),
+          },
+        },
+        encryption: { algorithm: 'A256CBC-HS512' },
+        data: TypedArrayEncoder.fromUtf8String('heelllo'),
+      })
+
+      const { data } = await service.decrypt(agentContext, {
+        key: {
+          keyAgreement: {
+            algorithm: 'ECDH-1PU+A256KW',
+            keyId: recipient.keyId,
+            encryptedKey: { encrypted: encryptedKey?.encrypted as Uint8Array },
+            ephemeralPublicJwk: ephemeral.publicJwk as Kms.KmsJwkPublicEcdh,
+            senderPublicJwk: toX25519PublicJwk(sender.publicJwk),
+          },
+        },
+        decryption: { algorithm: 'A256CBC-HS512', iv: iv as Uint8Array, tag: tag as Uint8Array },
+        encrypted,
+      })
 
       expect(TypedArrayEncoder.toUtf8String(data)).toEqual('heelllo')
     })
