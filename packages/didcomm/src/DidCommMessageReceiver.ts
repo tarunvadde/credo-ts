@@ -51,6 +51,9 @@ import type { DidCommV2SignedMessageWire } from './v2'
 
 const FIRST_MESSAGE_CONNECTION_ID_NAMESPACE = 'bc868bdd-e026-48ac-9d5a-fb5982597d72'
 
+const firstMessageConnectionId = (ourDid: string, theirDid: string) =>
+  uuidv5(`${ourDid} ${theirDid}`, FIRST_MESSAGE_CONNECTION_ID_NAMESPACE)
+
 @injectable()
 export class DidCommMessageReceiver {
   private envelopeRegistry: DidCommEnvelopeRegistry
@@ -446,6 +449,13 @@ export class DidCommMessageReceiver {
         )
         return { connection }
       }
+
+      // A first message that raced the one which used up a single-use invitation finds it Done
+      const racedConnection = await this.connectionService.findById(
+        agentContext,
+        firstMessageConnectionId(recipient, from)
+      )
+      if (racedConnection?.theirDid === from) return { connection: racedConnection }
     }
 
     // v1: use sender/recipient keys
@@ -477,7 +487,7 @@ export class DidCommMessageReceiver {
   ): Promise<{ connection: DidCommConnectionRecord; created: boolean }> {
     const connection = new DidCommConnectionRecord({
       ...props,
-      id: uuidv5(`${props.did} ${props.theirDid}`, FIRST_MESSAGE_CONNECTION_ID_NAMESPACE),
+      id: firstMessageConnectionId(props.did, props.theirDid),
     })
     const routing = rotate ? await this.rotateInviterDidForV2OOB(agentContext, connection) : undefined
 

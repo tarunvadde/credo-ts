@@ -21,6 +21,8 @@ import {
 import { DidCommBasicMessageEventTypes } from '../../basic-messages'
 import { DidCommConnectionEventTypes, DidCommDidExchangeState, DidCommHandshakeProtocol } from '../../connections'
 import { InMemoryDidRegistry } from '../../connections/__tests__/InMemoryDidRegistry'
+import { DidCommOutOfBandService } from '../DidCommOutOfBandService'
+import { DidCommOutOfBandState } from '../domain'
 
 const inMemoryDidsRegistry = new InMemoryDidRegistry()
 
@@ -177,6 +179,57 @@ describe('out of band implicit', () => {
     const faberConnections = await faberAgent.didcomm.connections.findAllByQuery({ theirDid: firstConnection.did })
     expect(faberConnections).toHaveLength(1)
     expect(faberConnections[0].id).not.toBe(oldFaberConnection.id)
+    expect(
+      await faberAgent.didcomm.basicMessages.findAllByQuery({ connectionId: faberConnections[0].id })
+    ).toHaveLength(2)
+  })
+
+  test('v2 single-use invitation: a first message racing the one that used up the invitation gets its connection', async () => {
+    const outOfBandRecord = await faberAgent.didcomm.oob.createInvitation({
+      didCommVersion: 'v2',
+      multiUseInvitation: false,
+    })
+    const { connectionRecord: aliceFaberConnection } = await aliceAgent.didcomm.oob.receiveInvitation(
+      outOfBandRecord.outOfBandInvitation,
+      { label: 'alice' }
+    )
+    if (!aliceFaberConnection) throw new Error('Expected a connection')
+
+    // Both messages pass the connection lookup before either creates the connection, and the second one only
+    // looks for the invitation after the first has marked it Done
+    const outOfBandService = faberAgent.dependencyManager.resolve(DidCommOutOfBandService)
+    const findCreatedByRecipientDid = outOfBandService.findCreatedByRecipientDid.bind(outOfBandService)
+    let secondLookupStarted: () => void = () => {}
+    const secondLookup = new Promise<void>((resolve) => {
+      secondLookupStarted = resolve
+    })
+    let lookups = 0
+    const spy = vi.spyOn(outOfBandService, 'findCreatedByRecipientDid').mockImplementation(async (context, dids) => {
+      lookups++
+      if (lookups === 1) {
+        await secondLookup
+      } else {
+        secondLookupStarted()
+        while ((await faberAgent.didcomm.oob.getById(outOfBandRecord.id)).state !== DidCommOutOfBandState.Done) {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+        }
+      }
+      return findCreatedByRecipientDid(context, dids)
+    })
+
+    try {
+      await Promise.all([
+        aliceAgent.didcomm.basicMessages.sendMessage(aliceFaberConnection.id, 'single use 1'),
+        aliceAgent.didcomm.basicMessages.sendMessage(aliceFaberConnection.id, 'single use 2'),
+      ])
+      await waitForBasicMessageSubject(faberMessageReplay, { content: 'single use 1' })
+      await waitForBasicMessageSubject(faberMessageReplay, { content: 'single use 2' })
+    } finally {
+      spy.mockRestore()
+    }
+
+    const faberConnections = await faberAgent.didcomm.connections.findAllByOutOfBandId(outOfBandRecord.id)
+    expect(faberConnections).toHaveLength(1)
     expect(
       await faberAgent.didcomm.basicMessages.findAllByQuery({ connectionId: faberConnections[0].id })
     ).toHaveLength(2)
