@@ -1,4 +1,5 @@
 import { type DidDocumentKey, Kms } from '@credo-ts/core'
+import { convertPublicKeyToX25519 } from '@stablelib/ed25519'
 import { Agent } from '../../../../../core/src/agent/Agent'
 import {
   DidCommV1Service,
@@ -6,11 +7,18 @@ import {
   DidDocumentService,
   DidsModule,
   getEd25519VerificationKey2018,
+  getX25519KeyAgreementKey2019,
   NewDidCommV2Service,
   NewDidCommV2ServiceEndpoint,
 } from '../../../../../core/src/modules/dids'
 import { type EventReplaySubject, setupEventReplaySubjects, setupSubjectTransports } from '../../../../../core/tests'
-import { getAgentOptions, waitForConnectionRecordSubject } from '../../../../../core/tests/helpers'
+import {
+  getAgentOptions,
+  waitForBasicMessageSubject,
+  waitForConnectionRecordSubject,
+  waitForDidRotateSubject,
+} from '../../../../../core/tests/helpers'
+import { DidCommBasicMessageEventTypes } from '../../basic-messages'
 import { DidCommConnectionEventTypes, DidCommDidExchangeState, DidCommHandshakeProtocol } from '../../connections'
 import { InMemoryDidRegistry } from '../../connections/__tests__/InMemoryDidRegistry'
 
@@ -21,6 +29,7 @@ const faberAgentOptions = getAgentOptions(
   {
     endpoints: ['rxjs:faber'],
     didcommVersions: ['v1', 'v2'],
+    connections: { autoAcceptConnections: true, autoCreateConnectionOnFirstMessage: true },
   },
   {},
   {
@@ -51,6 +60,7 @@ describe('out of band implicit', () => {
   let faberAgent: Agent<typeof faberAgentOptions.modules>
   let aliceAgent: Agent<typeof aliceAgentOptions.modules>
   let faberReplay: EventReplaySubject
+  let faberMessageReplay: EventReplaySubject
 
   beforeAll(async () => {
     faberAgent = new Agent(faberAgentOptions)
@@ -61,6 +71,13 @@ describe('out of band implicit', () => {
     await aliceAgent.initialize()
 
     ;[faberReplay] = setupEventReplaySubjects([faberAgent], [DidCommConnectionEventTypes.DidCommConnectionStateChanged])
+    ;[faberMessageReplay] = setupEventReplaySubjects(
+      [faberAgent],
+      [
+        DidCommBasicMessageEventTypes.DidCommBasicMessageStateChanged,
+        DidCommBasicMessageEventTypes.DidCommBasicMessageV2StateChanged,
+      ]
+    )
   })
 
   afterAll(async () => {
@@ -94,6 +111,75 @@ describe('out of band implicit', () => {
     expect(aliceFaberConnection?.invitationDid).toBe(inMemoryDid)
     expect(outOfBandRecord.outOfBandInvitation.v2Invitation?.from).toBe(inMemoryDid)
     expect(outOfBandRecord.outOfBandInvitation.v2Invitation?.body?.accept).toEqual(['didcomm/v2'])
+  })
+
+  test('v2 implicit invitation: first messages that arrive at the same time create one connection', async () => {
+    const inMemoryDid = await createInMemoryDid(faberAgent, 'rxjs:faber', { withKeyAgreement: true })
+    const { connectionRecord: aliceFaberConnection } = await aliceAgent.didcomm.oob.receiveImplicitInvitation({
+      did: inMemoryDid,
+      didCommVersion: 'v2',
+      label: 'alice',
+    })
+    if (!aliceFaberConnection) throw new Error('Expected a connection')
+    const peerDidsBefore = await faberAgent.dids.getCreatedDids({ method: 'peer' })
+
+    await Promise.all([
+      aliceAgent.didcomm.basicMessages.sendMessage(aliceFaberConnection.id, 'first'),
+      aliceAgent.didcomm.basicMessages.sendMessage(aliceFaberConnection.id, 'second'),
+    ])
+    await waitForBasicMessageSubject(faberMessageReplay, { content: 'first' })
+    await waitForBasicMessageSubject(faberMessageReplay, { content: 'second' })
+
+    const faberConnections = await faberAgent.didcomm.connections.findAllByQuery({ theirDid: aliceFaberConnection.did })
+    expect(faberConnections).toHaveLength(1)
+    expect(faberConnections[0].did).not.toBe(inMemoryDid)
+    expect(
+      await faberAgent.didcomm.basicMessages.findAllByQuery({ connectionId: faberConnections[0].id })
+    ).toHaveLength(2)
+    expect(await faberAgent.dids.getCreatedDids({ method: 'peer' })).toHaveLength(peerDidsBefore.length + 1)
+  })
+
+  test('v2 implicit invitation: a peer reusing its DID after hanging up gets one new connection', async () => {
+    const inMemoryDid = await createInMemoryDid(faberAgent, 'rxjs:faber', { withKeyAgreement: true })
+    const { connectionRecord: firstConnection } = await aliceAgent.didcomm.oob.receiveImplicitInvitation({
+      did: inMemoryDid,
+      didCommVersion: 'v2',
+      label: 'alice',
+    })
+    if (!firstConnection?.did) throw new Error('Expected a connection')
+
+    await aliceAgent.didcomm.basicMessages.sendMessage(firstConnection.id, 'before hangup')
+    await waitForBasicMessageSubject(faberMessageReplay, { content: 'before hangup' })
+    const [oldFaberConnection] = await faberAgent.didcomm.connections.findAllByQuery({ theirDid: firstConnection.did })
+
+    const [faberRotateReplay] = setupEventReplaySubjects(
+      [faberAgent],
+      [DidCommConnectionEventTypes.DidCommConnectionDidRotated]
+    )
+    await aliceAgent.didcomm.connections.hangup({ connectionId: firstConnection.id })
+    await waitForDidRotateSubject(faberRotateReplay, {})
+
+    const { connectionRecord: secondConnection } = await aliceAgent.didcomm.oob.receiveImplicitInvitation({
+      did: inMemoryDid,
+      didCommVersion: 'v2',
+      label: 'alice',
+      ourDid: firstConnection.did,
+    })
+    if (!secondConnection) throw new Error('Expected a connection')
+
+    await Promise.all([
+      aliceAgent.didcomm.basicMessages.sendMessage(secondConnection.id, 'after hangup 1'),
+      aliceAgent.didcomm.basicMessages.sendMessage(secondConnection.id, 'after hangup 2'),
+    ])
+    await waitForBasicMessageSubject(faberMessageReplay, { content: 'after hangup 1' })
+    await waitForBasicMessageSubject(faberMessageReplay, { content: 'after hangup 2' })
+
+    const faberConnections = await faberAgent.didcomm.connections.findAllByQuery({ theirDid: firstConnection.did })
+    expect(faberConnections).toHaveLength(1)
+    expect(faberConnections[0].id).not.toBe(oldFaberConnection.id)
+    expect(
+      await faberAgent.didcomm.basicMessages.findAllByQuery({ connectionId: faberConnections[0].id })
+    ).toHaveLength(2)
   })
 
   test('v2 with handshakeProtocols throws', async () => {
@@ -315,7 +401,7 @@ describe('out of band implicit', () => {
   })
 })
 
-async function createInMemoryDid(agent: Agent, endpoint: string) {
+async function createInMemoryDid(agent: Agent, endpoint: string, { withKeyAgreement = false } = {}) {
   const ed25519Key = await agent.kms.createKey({
     type: {
       kty: 'OKP',
@@ -364,6 +450,19 @@ async function createInMemoryDid(agent: Agent, endpoint: string) {
   builder.addVerificationMethod(ed25519VerificationMethod)
   builder.addAuthentication(ed25519VerificationMethod.id)
   builder.addAssertionMethod(ed25519VerificationMethod.id)
+  if (withKeyAgreement) {
+    builder.addKeyAgreement(
+      getX25519KeyAgreementKey2019({
+        id: `${did}#key-agreement-1`,
+        controller: did,
+        publicJwk: Kms.PublicJwk.fromPublicKey({
+          kty: 'OKP',
+          crv: 'X25519',
+          publicKey: convertPublicKeyToX25519(publicJwk.publicKey.publicKey),
+        }),
+      })
+    )
+  }
 
   // Create the did:inmemory did
   const {
@@ -377,6 +476,9 @@ async function createInMemoryDid(agent: Agent, endpoint: string) {
           didDocumentRelativeKeyId: `#${publicJwk.fingerprint}`,
           kmsKeyId: ed25519Key.keyId,
         } satisfies DidDocumentKey,
+        ...(withKeyAgreement
+          ? [{ didDocumentRelativeKeyId: '#key-agreement-1', kmsKeyId: ed25519Key.keyId } satisfies DidDocumentKey]
+          : []),
       ],
     },
   })

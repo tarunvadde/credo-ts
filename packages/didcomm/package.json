@@ -35,7 +35,8 @@
     "class-validator": "catalog:",
     "luxon": "^3.7.2",
     "query-string": "^9.3.1",
-    "rxjs": "catalog:"
+    "rxjs": "catalog:",
+    "uuid": "^14.0.2"
   },
   "devDependencies": {
     "@animo-id/pex": "catalog:",

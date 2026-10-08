@@ -858,6 +858,9 @@ importers:
       rxjs:
         specifier: 'catalog:'
         version: 7.8.2
+      uuid:
+        specifier: ^14.0.2
+        version: 14.0.2
     devDependencies:
       '@animo-id/pex':
         specifier: 'catalog:'

@@ -279,6 +279,8 @@ export class DidCommMediationRecipientService {
       .pipe(
         filterContextCorrelationId(agentContext.contextCorrelationId),
         filter((event) => mediationRecord.id === event.payload.mediationRecord.id),
+        // Several keylist updates to one mediator can be in flight at once
+        filter((event) => event.payload.updated.some((item) => item.recipientDid === updates[0].recipientDid)),
         first(),
         timeout({
           first: timeoutMs,

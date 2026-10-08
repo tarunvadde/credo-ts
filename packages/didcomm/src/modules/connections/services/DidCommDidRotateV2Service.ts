@@ -69,15 +69,15 @@ export class DidCommDidRotateV2Service {
 
   /**
    * Rotate our DID on a v2 connection. If `toDid` is given, switch to it (must be a DID we own);
-   * otherwise make a new peer DID from `routing`. Saves the new DID on the connection and stores the
-   * from_prior JWT that later messages carry to tell the other side about the change.
+   * otherwise make a new peer DID from `routing`. Saves the new DID on the connection (unless `save` is
+   * false) and stores the from_prior JWT that later messages carry to tell the other side about the change.
    */
   public async rotateOurDid(
     agentContext: AgentContext,
     connection: DidCommConnectionRecord,
-    options: { toDid?: string; routing?: DidCommRouting }
+    options: { toDid?: string; routing?: DidCommRouting; save?: boolean }
   ): Promise<{ newDid: string; fromPriorJwt: string }> {
-    const { toDid, routing } = options
+    const { toDid, routing, save = true } = options
     if (!connection.did) {
       throw new CredoError(`Cannot rotate connection '${connection.id}': no current did`)
     }
@@ -123,7 +123,7 @@ export class DidCommDidRotateV2Service {
       newDid,
     })
 
-    await agentContext.dependencyManager.resolve(DidCommConnectionService).update(agentContext, connection)
+    if (save) await agentContext.dependencyManager.resolve(DidCommConnectionService).update(agentContext, connection)
 
     return { newDid, fromPriorJwt }
   }
