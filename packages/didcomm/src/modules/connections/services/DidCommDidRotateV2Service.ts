@@ -16,6 +16,7 @@ import {
   JwsService,
   Jwt,
   JwtPayload,
+  Kms,
   type Logger,
   utils,
   type VerificationMethod,
@@ -284,7 +285,10 @@ export class DidCommDidRotateV2Service {
     if (services.length === 0) {
       throw new CredoError(`No DIDComm service resolvable for '${connection.theirDid}'`)
     }
-    const service = services[0]
+    const service =
+      services.find((s) =>
+        s.recipientKeys.some((k) => k.is(Kms.X25519PublicJwk, Kms.P256PublicJwk, Kms.P384PublicJwk))
+      ) ?? services[0]
     if (service.recipientKeys.length === 0) {
       throw new CredoError(`Resolved DIDComm service for '${connection.theirDid}' has no recipient key`)
     }
