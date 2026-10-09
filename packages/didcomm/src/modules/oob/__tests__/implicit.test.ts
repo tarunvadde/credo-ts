@@ -11,6 +11,7 @@ import {
   NewDidCommV2Service,
   NewDidCommV2ServiceEndpoint,
 } from '../../../../../core/src/modules/dids'
+import { isValidUuid } from '../../../../../core/src/utils/uuid'
 import { type EventReplaySubject, setupEventReplaySubjects, setupSubjectTransports } from '../../../../../core/tests'
 import {
   getAgentOptions,
@@ -134,6 +135,7 @@ describe('out of band implicit', () => {
 
     const faberConnections = await faberAgent.didcomm.connections.findAllByQuery({ theirDid: aliceFaberConnection.did })
     expect(faberConnections).toHaveLength(1)
+    expect(isValidUuid(faberConnections[0].id)).toBe(true)
     expect(faberConnections[0].did).not.toBe(inMemoryDid)
     expect(
       await faberAgent.didcomm.basicMessages.findAllByQuery({ connectionId: faberConnections[0].id })

@@ -5,6 +5,7 @@ import {
   CredoError,
   DidRepository,
   DidsApi,
+  Hasher,
   InjectionSymbols,
   inject,
   injectable,
@@ -12,8 +13,8 @@ import {
   Kms,
   type Logger,
   RecordDuplicateError,
+  TypedArrayEncoder,
 } from '@credo-ts/core'
-import { v5 as uuidv5 } from 'uuid'
 import { DidCommDispatcher, isProblemReportMessageType } from './DidCommDispatcher'
 import type { DecryptedDidCommMessageContext } from './DidCommEnvelopeService'
 import { DidCommMessage } from './DidCommMessage'
@@ -49,10 +50,16 @@ import { isValidJweStructure } from './util/JWE'
 import { parseMessageType, replaceLegacyDidSovPrefixOnMessage } from './util/messageType'
 import type { DidCommV2SignedMessageWire } from './v2'
 
-const FIRST_MESSAGE_CONNECTION_ID_NAMESPACE = 'bc868bdd-e026-48ac-9d5a-fb5982597d72'
+// A name-based UUIDv8 from SHA-256 (RFC 9562 appendix B.2), so it still fits storage that types ids as uuid
+function uuidFromName(name: string): string {
+  const bytes = Hasher.hash(name, 'sha-256').slice(0, 16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x80
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = TypedArrayEncoder.toHex(bytes)
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
 
-const firstMessageConnectionId = (ourDid: string, theirDid: string) =>
-  uuidv5(`${ourDid} ${theirDid}`, FIRST_MESSAGE_CONNECTION_ID_NAMESPACE)
+const firstMessageConnectionId = (ourDid: string, theirDid: string) => uuidFromName(`${ourDid} ${theirDid}`)
 
 @injectable()
 export class DidCommMessageReceiver {
@@ -509,7 +516,7 @@ export class DidCommMessageReceiver {
 
       // The id belongs to an earlier relationship with this DID pair that has ended. Derive the next id
       // from it, so first messages that race on a reconnect also end up on one connection.
-      connection.id = uuidv5(existing.id, FIRST_MESSAGE_CONNECTION_ID_NAMESPACE)
+      connection.id = uuidFromName(existing.id)
     }
   }
 
