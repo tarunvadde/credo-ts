@@ -6,6 +6,8 @@ export interface DidCommOutboundTransport {
 
   sendMessage(outboundPackage: DidCommOutboundPackage): Promise<void>
 
+  closeSocketByConnectionId?(connectionId: string): void
+
   start(agentContext: AgentContext): Promise<void>
   stop(): Promise<void>
 }

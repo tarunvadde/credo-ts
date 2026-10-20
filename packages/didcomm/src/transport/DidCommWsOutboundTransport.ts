@@ -89,6 +89,14 @@ export class DidCommWsOutboundTransport implements DidCommOutboundTransport {
     }
   }
 
+  public closeSocketByConnectionId(connectionId: string): void {
+    for (const [socketId, socket] of this.transportTable) {
+      if (socketId.endsWith(`-${connectionId}`)) {
+        socket.close()
+      }
+    }
+  }
+
   private async resolveSocket({
     socketId,
     endpoint,

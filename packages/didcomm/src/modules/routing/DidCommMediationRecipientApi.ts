@@ -223,10 +223,19 @@ export class DidCommMediationRecipientApi {
             }
           } catch (error) {
             this.logger.warn('Unable to re-open websocket connection to mediator', { error })
+            this.closeMediatorSockets(mediator.connectionId)
           }
         },
         complete: () => this.logger.info(`Stopping pickup of messages from mediator '${mediator.id}'`),
       })
+  }
+
+  // A socket left open without live mode is never retried, closing it hands it to the reconnect loop
+  private closeMediatorSockets(connectionId: string): void {
+    const { outboundTransports } = this.agentContext.dependencyManager.resolve(DidCommModuleConfig)
+    for (const transport of outboundTransports) {
+      transport.closeSocketByConnectionId?.(connectionId)
+    }
   }
 
   /**
@@ -280,17 +289,22 @@ export class DidCommMediationRecipientApi {
         this.logger.info(`Starting Live Mode pickup of messages from mediator '${mediatorRecord.id}'`)
         await this.monitorMediatorWebSocketEvents(mediatorRecord, mediatorPickupStrategy)
 
-        await this.messagePickupApi.pickupMessages({
-          connectionId: mediatorConnection.id,
-          protocolVersion: 'v2',
-          awaitCompletion: true,
-        })
+        try {
+          await this.messagePickupApi.pickupMessages({
+            connectionId: mediatorConnection.id,
+            protocolVersion: 'v2',
+            awaitCompletion: true,
+          })
 
-        await this.messagePickupApi.setLiveDeliveryMode({
-          connectionId: mediatorConnection.id,
-          liveDelivery: true,
-          protocolVersion: 'v2',
-        })
+          await this.messagePickupApi.setLiveDeliveryMode({
+            connectionId: mediatorConnection.id,
+            liveDelivery: true,
+            protocolVersion: 'v2',
+          })
+        } catch (error) {
+          this.closeMediatorSockets(mediatorConnection.id)
+          throw error
+        }
 
         break
       case DidCommMediatorPickupStrategy.Implicit:
