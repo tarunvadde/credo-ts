@@ -1,7 +1,9 @@
+import type { DcqlQuery } from '@credo-ts/core'
 import {
   Agent,
   ClaimFormat,
   DcqlService,
+  DidKey,
   JsonEncoder,
   SdJwtVcRecord,
   W3cV2Credential,
@@ -20,7 +22,7 @@ import {
   waitForCredentialRecordSubject,
   waitForProofExchangeRecordSubject,
 } from '../../core/tests'
-import type { DcqlPresentationAttachment, DcqlRequestAttachment } from '../src'
+import type { DcqlPresentationAttachment, DcqlRequestAttachment, DidCommConnectionsModuleConfigOptions } from '../src'
 import {
   DidCommCredentialEventTypes,
   DidCommCredentialState,
@@ -31,18 +33,20 @@ import {
   DidCommProofEventTypes,
   DidCommProofState,
   DidCommProofV2Protocol,
+  DidCommRoutingService,
   DidCommW3cV2SdJwtCredentialFormatService,
 } from '../src'
+import { createPeerDidForV2OOB } from '../src/modules/connections/services/helpers'
 import { DidCommV2EnvelopeService } from '../src/v2'
 
 const VCT = 'https://credentials.example.com/identity_credential'
 
-const getModules = (endpoint: string) =>
+const getModules = (endpoint: string, connections?: DidCommConnectionsModuleConfigOptions) =>
   ({
     didcomm: new DidCommModule({
       endpoints: [endpoint],
       didcommVersions: ['v1', 'v2'],
-      connections: { autoAcceptConnections: true },
+      connections: { autoAcceptConnections: true, ...connections },
       credentials: {
         credentialProtocols: [
           new DidCommCredentialV2Protocol({ credentialFormats: [new DidCommW3cV2SdJwtCredentialFormatService()] }),
@@ -346,7 +350,7 @@ describe.each(['v1', 'v2'] as const)('DCQL proof format over a DIDComm %s connec
       state: DidCommProofState.RequestReceived,
     })
     await expect(holderAgent.didcomm.proofs.acceptRequest({ proofExchangeRecordId: holderRecord.id })).rejects.toThrow(
-      "audience 'didcomm:did:example:other-verifier' does not match the DID of connection"
+      "audience 'didcomm:did:example:other-verifier' is not the verifier DID of the connection"
     )
 
     await holderAgent.didcomm.proofs.sendProblemReport({
@@ -355,6 +359,21 @@ describe.each(['v1', 'v2'] as const)('DCQL proof format over a DIDComm %s connec
     })
     await waitForProofExchangeRecordSubject(verifierReplay, { threadId, state: DidCommProofState.Abandoned })
     expect(await verifierAgent.didcomm.proofs.findPresentationMessage(verifierRecord.id)).toBeNull()
+  })
+
+  test('verifier rejects an audienceDid that is not the connection DID', async () => {
+    await expect(
+      verifierAgent.didcomm.proofs.requestProof({
+        connectionId: verifierConnectionId,
+        protocolVersion: 'v2',
+        proofFormats: {
+          dcql: {
+            dcqlQuery: { credentials: [{ id: 'pid', format: 'dc+sd-jwt', meta: { vct_values: [VCT] } }] },
+            audienceDid: 'did:example:other-verifier',
+          },
+        },
+      })
+    ).rejects.toThrow("DCQL audienceDid 'did:example:other-verifier' is not the DID of connection")
   })
 
   test("verifier rejects a vp+sd-jwt that is not signed with the credential's cnf key", async () => {
@@ -429,5 +448,130 @@ describe.each(['v1', 'v2'] as const)('DCQL proof format over a DIDComm %s connec
     })
     expect(abandonedRecord.errorMessage).toContain("vp+sd-jwt is not signed with the credential 'cnf' key")
     await waitForProofExchangeRecordSubject(holderReplay, { threadId, state: DidCommProofState.Abandoned })
+  })
+})
+
+describe('DCQL proof format out of band', () => {
+  let verifierAgent: DcqlAgent
+  let holderAgent: DcqlAgent
+  let verifierReplay: EventReplaySubject
+  let holderReplay: EventReplaySubject
+
+  const dcqlQuery: DcqlQuery = {
+    credentials: [{ id: 'pid', format: 'dc+sd-jwt', meta: { vct_values: [VCT] }, claims: [{ path: ['given_name'] }] }],
+  }
+
+  beforeAll(async () => {
+    verifierAgent = new Agent(
+      getAgentOptions(
+        'DCQL out-of-band verifier',
+        {},
+        {},
+        getModules('rxjs:dcql-oob-verifier', { autoCreateConnectionOnFirstMessage: true }),
+        { requireDidcomm: true }
+      )
+    )
+    holderAgent = new Agent(
+      getAgentOptions('DCQL out-of-band holder', {}, {}, getModules('rxjs:dcql-oob-holder'), { requireDidcomm: true })
+    )
+
+    setupSubjectTransports([verifierAgent, holderAgent])
+    await verifierAgent.initialize()
+    await holderAgent.initialize()
+    ;[verifierReplay, holderReplay] = setupEventReplaySubjects(
+      [verifierAgent, holderAgent],
+      [DidCommProofEventTypes.ProofStateChanged]
+    )
+
+    const issuerKdv = await createDidKidVerificationMethod(verifierAgent.context)
+    const holderKdv = await createDidKidVerificationMethod(holderAgent.context)
+    const sdJwtVc = await verifierAgent.sdJwtVc.sign({
+      issuer: { method: 'did', didUrl: issuerKdv.kid },
+      holder: { method: 'did', didUrl: holderKdv.kid },
+      payload: { vct: VCT, given_name: 'Erika' },
+      disclosureFrame: { _sd: ['given_name'] },
+    })
+    await holderAgent.sdJwtVc.store({
+      record: SdJwtVcRecord.fromSdJwtVc(holderAgent.sdJwtVc.fromCompact(sdJwtVc.compact)),
+    })
+  })
+
+  afterAll(async () => {
+    await verifierAgent?.shutdown()
+    await holderAgent?.shutdown()
+  })
+
+  const getRouting = () =>
+    verifierAgent.dependencyManager.resolve(DidCommRoutingService).getRouting(verifierAgent.context, {})
+
+  const createRequest = (audienceDid: string) =>
+    verifierAgent.didcomm.proofs.createRequest({
+      protocolVersion: 'v2',
+      willConfirm: true,
+      proofFormats: { dcql: { dcqlQuery, audienceDid } },
+    })
+
+  const present = async (threadId: string): Promise<{ audience: string; kbJwtAudience: unknown }> => {
+    const holderRecord = await waitForProofExchangeRecordSubject(holderReplay, {
+      threadId,
+      state: DidCommProofState.RequestReceived,
+    })
+    await holderAgent.didcomm.proofs.acceptRequest({ proofExchangeRecordId: holderRecord.id })
+
+    const verifierRecord = await waitForProofExchangeRecordSubject(verifierReplay, {
+      threadId,
+      state: DidCommProofState.PresentationReceived,
+    })
+    expect(verifierRecord.isVerified).toBe(true)
+    await verifierAgent.didcomm.proofs.acceptPresentation({ proofExchangeRecordId: verifierRecord.id })
+    await waitForProofExchangeRecordSubject(holderReplay, { threadId, state: DidCommProofState.Done })
+
+    const formatData = await verifierAgent.didcomm.proofs.getFormatData(verifierRecord.id)
+    const request = formatData.request?.dcql as DcqlRequestAttachment
+    const presentation = formatData.presentation?.dcql as DcqlPresentationAttachment
+    const { audience } = request
+    const [vpToken] = presentation.vp_token.pid
+    const kbJwt = decodeJwt(vpToken.split('~').pop() as string).payload as { aud: unknown }
+
+    return { audience, kbJwtAudience: kbJwt.aud }
+  }
+
+  test('createRequest without a connection needs a bare audienceDid', async () => {
+    await expect(
+      verifierAgent.didcomm.proofs.createRequest({ protocolVersion: 'v2', proofFormats: { dcql: { dcqlQuery } } })
+    ).rejects.toThrow('DCQL requests without a connection need proofFormats.dcql.audienceDid')
+    await expect(createRequest('did:example:verifier#key-1')).rejects.toThrow(
+      'DCQL requests without a connection need proofFormats.dcql.audienceDid'
+    )
+  })
+
+  test('v2 invitation: the audience is the DID the invitation is from', async () => {
+    const { did } = await createPeerDidForV2OOB(verifierAgent.context, await getRouting())
+    const { message, proofRecord } = await createRequest(did)
+    const { outOfBandInvitation } = await verifierAgent.didcomm.oob.createInvitation({
+      messages: [message],
+      didCommVersion: 'v2',
+      ourDid: did,
+    })
+    await holderAgent.didcomm.oob.receiveInvitation(outOfBandInvitation, { label: 'holder' })
+
+    const { audience, kbJwtAudience } = await present(proofRecord.threadId)
+    expect(audience).toBe(`didcomm:${outOfBandInvitation.v2Invitation?.from}`)
+    expect(kbJwtAudience).toBe(audience)
+  })
+
+  test('legacy connectionless: the audience is the did:key of the service recipient key', async () => {
+    const routing = await getRouting()
+    const { message, proofRecord } = await createRequest(new DidKey(routing.recipientKey).did)
+    const { invitationUrl } = await verifierAgent.didcomm.oob.createLegacyConnectionlessInvitation({
+      message,
+      domain: 'https://verifier.example.com',
+      routing,
+    })
+    await holderAgent.didcomm.oob.receiveInvitationFromUrl(invitationUrl, { label: 'holder' })
+
+    const { audience, kbJwtAudience } = await present(proofRecord.threadId)
+    expect(audience).toBe(`didcomm:${new DidKey(routing.recipientKey).did}`)
+    expect(kbJwtAudience).toBe(audience)
   })
 })
