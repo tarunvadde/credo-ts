@@ -15,6 +15,7 @@ import {
   asArray,
   CredoError,
   DcqlService,
+  DidKey,
   DidsApi,
   deepEquality,
   getPublicJwkFromVerificationMethod,
@@ -32,6 +33,7 @@ import {
   W3cV2SdJwtVerifiableCredential,
   W3cV2SdJwtVerifiablePresentation,
 } from '@credo-ts/core'
+import type { DidCommMessage } from '../../../../DidCommMessage'
 import { DidCommAttachment, DidCommAttachmentData } from '../../../../decorators/attachment/DidCommAttachment'
 import { DidCommDocumentService } from '../../../../services'
 import type { DidCommConnectionRecord } from '../../../connections'
@@ -56,6 +58,7 @@ import type {
   DidCommProofFormatGetCredentialsForRequestOptions,
   DidCommProofFormatProcessOptions,
   DidCommProofFormatProcessPresentationOptions,
+  DidCommProofFormatProcessRequestOptions,
   DidCommProofFormatSelectCredentialsForRequestOptions,
 } from '../DidCommProofFormatServiceOptions'
 import type {
@@ -193,11 +196,11 @@ export class DidCommDcqlProofFormatService implements DidCommProofFormatService<
 
   public async processRequest(
     agentContext: AgentContext,
-    { attachment, proofRecord }: DidCommProofFormatProcessOptions
+    { attachment, proofRecord, requestMessage }: DidCommProofFormatProcessRequestOptions
   ): Promise<void> {
     try {
       const request = this.parseRequest(agentContext, attachment)
-      await this.assertAudience(agentContext, proofRecord, request.audience)
+      await this.assertAudience(agentContext, proofRecord, request.audience, requestMessage)
     } catch (error) {
       throw new V2PresentationProblemReportError(error.message, {
         problemCode: DidCommPresentationProblemReportReason.Abandoned,
@@ -221,9 +224,9 @@ export class DidCommDcqlProofFormatService implements DidCommProofFormatService<
       if (!credentialQuery || !SUPPORTED_CREDENTIAL_FORMATS.includes(credentialQuery.format)) {
         throw new CredoError("DCQL requests can only be presented with 'dc+sd-jwt' or 'vc+sd-jwt' credentials")
       }
+      this.assertVcSdJwtHolderBindingRequired(credentialQuery)
       if (
         credentialQuery.format === 'vc+sd-jwt' &&
-        credentialQuery.require_cryptographic_holder_binding !== false &&
         entries.some(
           ({ credentialRecord }) =>
             !(credentialRecord.firstCredential instanceof W3cV2SdJwtVerifiableCredential) ||
@@ -272,7 +275,9 @@ export class DidCommDcqlProofFormatService implements DidCommProofFormatService<
       }
 
       const requireHolderBinding = credentialQuery.require_cryptographic_holder_binding !== false
-      for (const entry of entries) {
+      // Entries of other formats cannot be decoded here and are discarded by verifyPresentation
+      const checkedEntries = SUPPORTED_CREDENTIAL_FORMATS.includes(credentialQuery.format) ? entries : []
+      for (const entry of checkedEntries) {
         const { nonce, aud } = this.decodeNonceAndAudience(credentialQuery, entry)
         if (
           ((requireHolderBinding || nonce !== undefined) && nonce !== request.nonce) ||
@@ -371,7 +376,9 @@ export class DidCommDcqlProofFormatService implements DidCommProofFormatService<
     attachmentId?: string,
     audienceDid?: string
   ): Promise<DidCommProofFormatCreateReturn> {
-    this.validateDcqlQuery(agentContext, dcqlQuery)
+    for (const credentialQuery of this.validateDcqlQuery(agentContext, dcqlQuery).credentials) {
+      this.assertVcSdJwtHolderBindingRequired(credentialQuery)
+    }
     const verifierDid = await this.getVerifierDid(agentContext, proofRecord, audienceDid)
 
     const kms = agentContext.resolve(Kms.KeyManagementApi)
@@ -443,6 +450,14 @@ export class DidCommDcqlProofFormatService implements DidCommProofFormatService<
     return parsed
   }
 
+  private assertVcSdJwtHolderBindingRequired(credentialQuery: DcqlCredentialQuery): void {
+    if (credentialQuery.format === 'vc+sd-jwt' && credentialQuery.require_cryptographic_holder_binding === false) {
+      throw new CredoError(
+        `Credential Query '${credentialQuery.id}' asks for a vc+sd-jwt without holder binding, which is not supported`
+      )
+    }
+  }
+
   private async getVerifierDid(
     agentContext: AgentContext,
     proofRecord: DidCommProofExchangeRecord,
@@ -473,7 +488,8 @@ export class DidCommDcqlProofFormatService implements DidCommProofFormatService<
   private async assertAudience(
     agentContext: AgentContext,
     proofRecord: DidCommProofExchangeRecord,
-    audience: string
+    audience: string,
+    requestMessage: DidCommMessage
   ): Promise<void> {
     const audienceDid = audience.slice(AUDIENCE_PREFIX.length)
     const connection = proofRecord.connectionId
@@ -495,7 +511,7 @@ export class DidCommDcqlProofFormatService implements DidCommProofFormatService<
     if (outOfBandRecord) {
       const { outOfBandInvitation } = outOfBandRecord
       const invitationFrom = outOfBandInvitation.v2Invitation?.from
-      if (invitationFrom) {
+      if (invitationFrom && (!connection || connection.invitationDid === invitationFrom)) {
         if (!areEquivalentDidPeer4Forms(parseDid(invitationFrom).did, audienceDid)) {
           throw new CredoError(`DCQL request audience '${audience}' is not the DID the invitation is from`)
         }
@@ -508,6 +524,16 @@ export class DidCommDcqlProofFormatService implements DidCommProofFormatService<
       }
       if (!connection) {
         await this.assertAudienceIsServiceDid(agentContext, outOfBandInvitation.getServices(), audience)
+        // A v1 only agent sends the presentation to the `~service`, see getServicesForMessage
+        const requestServiceKeys = requestMessage.service?.resolvedDidCommService.recipientKeys
+        if (
+          requestServiceKeys &&
+          (requestServiceKeys.length !== 1 || new DidKey(requestServiceKeys[0]).did !== audienceDid)
+        ) {
+          throw new CredoError(
+            `DCQL request audience '${audience}' is not the DID of the service the presentation goes to`
+          )
+        }
         return
       }
     }
